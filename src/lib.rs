@@ -12,23 +12,26 @@ pub mod core {
 		fn read_mem(&self, addr: u16) -> u8;
 		fn write_mem(&mut self, addr: u16, v: u8);
 		fn clear_screen(&mut self);
-		fn screen_xor_line(&mut self, x: u16, y: u16, bits: u8);
+		fn screen_xor_line(&mut self, x: u8, y: u8, bits: u8) -> bool;
 		fn get_key_status(&self, k: u8) -> bool;
 		fn wait_for_keypress(&mut self) -> u8;
 	}
 
+	#[derive(Clone, Copy, PartialEq)]
 	pub enum Register8 {
 		Generic(u8), // Must be < 16
 		DelayTimer,
 		SoundTimer,
 	}
 
+	#[derive(Clone, Copy, PartialEq)]
 	enum IntermediateValue {
 		Bool(bool),
 		Addr(u16),
 		Byte(u8),
 	}
 
+	#[derive(PartialEq, Clone, Copy)]
 	pub enum IntermediateInst {
 		Illegal,
 
@@ -38,10 +41,8 @@ pub mod core {
 		WriteScreen,
 		WaitForKeypress,
 		KeyPressed,
-		/// Returns the memory address where hex characters are stored
-		/// They must be stored in increasing order, such that each
-		/// character can be found at `base_addr + 5 * digit`
-		HexCharBase,
+		/// Returns the memory address where the appropriate hex character is stored
+		HexCharAddr,
 
 		RegRead(Register8),
 		RegWrite(Register8),
@@ -49,12 +50,11 @@ pub mod core {
 		MemWrite, // pops addr, value
 		GetI,
 		SetI,
-		GetNextPC,
 		SetPC,
 		OffsetPC, // UNCLEAR
 		CondSkipPC,
-		StackPush,
-		StackPop,
+		Call,
+		Ret,
 
 		PushImm(u8),
 		PushImm16(u16),
@@ -75,16 +75,94 @@ pub mod core {
 
 		// 8-bit instructions
 		Add,
-		Sub,
+		AddOv,
 		BOr,
 		BAnd,
 		BXor,
+		DivMod10,
 		// 8-bit unary
-		BShl,
-		BShr,
+		Neg,
+		BShlOv,
+		BShrOv,
 
 		// 12-bit instructions
 		AddOffset,
+	}
+
+	impl IntermediateInst {
+		fn execute<S: Chip8State>(self, state: &mut S, stack: &mut Vec<IntermediateValue>) -> bool {
+			use IntermediateInst::*;
+			use IntermediateValue::*;
+			match self {
+				Illegal => panic!("Executed illegal instruction"),
+				ClearScreen => state.clear_screen(),
+				WriteScreen => {
+					let n = match stack.pop().unwrap() { Byte(x) => x, _ => unreachable!(), };
+					let y = match stack.pop().unwrap() { Byte(x) => x, _ => unreachable!(), };
+					let x = match stack.pop().unwrap() { Byte(x) => x, _ => unreachable!(), };
+					stack.push(Bool(state.screen_xor_line(x, y, n)));
+				},
+				WaitForKeypress => stack.push(Byte(state.wait_for_keypress())),
+				KeyPressed => {
+					let k = match stack.pop().unwrap() { Byte(x) => x, _ => unreachable!(), };
+					stack.push(Bool(state.get_key_status(k)));
+				},
+				HexCharAddr => unimplemented!(),
+
+				RegRead(Register8::Generic(x)) => stack.push(Byte(state.read_gp_register(x))),
+				RegWrite(Register8::Generic(x)) => {
+					let v = match stack.pop().unwrap() { Byte(x) => x, _ => unreachable!(), };
+					state.write_gp_register(x, v);
+				}
+				// XXX
+
+				PushImm(v) => stack.push(Byte(v)),
+				PushImm16(v) => stack.push(Addr(v)),
+				Swap2 => { let l = stack.len(); stack.swap(l - 2, l - 1); },
+				PopIgnore => drop(stack.pop().unwrap()),
+				Rand => unimplemented!(),
+
+				True => stack.push(Bool(true)),
+				False => stack.push(Bool(false)),
+				Equal => {
+					let a = stack.pop().unwrap();
+					let b = stack.pop().unwrap();
+					stack.push(Bool(match (a, b) {
+						(Byte(a), Byte(b)) => a == b,
+						_ => unimplemented!(),
+					}));
+				},
+				BoolNot => {
+					let v = match stack.pop().unwrap() { Bool(x) => x, _ => unreachable!(), };
+					stack.push(Bool(!v));
+				},
+				BoolOr => {
+					let a = match stack.pop().unwrap() { Bool(x) => x, _ => unreachable!(), };
+					let b = match stack.pop().unwrap() { Bool(x) => x, _ => unreachable!(), };
+					stack.push(Bool(a | b));
+				},
+				Select => {
+					let a = stack.pop().unwrap();
+					let b = stack.pop().unwrap();
+					let s = match stack.pop().unwrap() { Bool(x) => x, _ => unreachable!(), };
+					match (a, b) {
+						(Byte(_), Byte(_)) => {}
+						_ => unimplemented!(),
+					}
+					stack.push(if s { a } else { b });
+				}
+
+				Add => unimplemented!(),
+				// XXX
+				Neg => unimplemented!(),
+				// XXX
+
+				AddOffset => unimplemented!(),
+
+				_ => unimplemented!(),
+			}
+			false
+		}
 	}
 
 	pub fn parse_instruction(inst: u16) -> Option<Vec<IntermediateInst>> {
@@ -110,12 +188,12 @@ pub mod core {
 				// SYS
 				match inst {
 					0x00E0 => vec![ClearScreen],
-					0x00EE => vec![StackPop, SetPC],
+					0x00EE => vec![Ret],
 					_ => return None,
 				}
 			},
-			0x1 => vec![                      PushImm16(inst & 0xFFF), SetPC],
-			0x2 => vec![GetNextPC, StackPush, PushImm16(inst & 0xFFF), SetPC],
+			0x1 => vec![PushImm16(inst & 0xFFF), SetPC],
+			0x2 => vec![PushImm16(inst & 0xFFF), Call],
 			0x3 => vec![RegRead(Register8::Generic(n2)), PushImm(inst as u8),             Equal,          CondSkipPC],
 			0x4 => vec![RegRead(Register8::Generic(n2)), PushImm(inst as u8),             Equal, BoolNot, CondSkipPC],
 			0x5 if n4 == 0
@@ -124,18 +202,51 @@ pub mod core {
 			0x7 => vec![RegRead(Register8::Generic(n2)), PushImm(inst as u8), Add, RegWrite(Register8::Generic(n2))],
 			0x8 => {
 				// Ops
-				unimplemented!()
-/*
-			(  8,   x,   y,   0) => Chip8Instruction::Move { dst: x, src: y },
-			(  8,   x,   y,   1) => Chip8Instruction::BitOr { dst: x, src: y },
-			(  8,   x,   y,   2) => Chip8Instruction::BitAnd { dst: x, src: y },
-			(  8,   x,   y,   3) => Chip8Instruction::BitXor { dst: x, src: y },
-			(  8,   x,   y,   4) => Chip8Instruction::Add { dst: x, src: y },
-			(  8,   x,   y,   5) => Chip8Instruction::Sub { dst: x, src: y },
-			(  8,   x,   y,   6) => Chip8Instruction::BitShr { dst: x, src: y },
-			(  8,   x,   y,   7) => Chip8Instruction::SubNeg { dst: x, src: y },
-			(  8,   x,   y, 0xE) => Chip8Instruction::BitShl { dst: x, src: y },
-*/
+				let mut v = vec![RegRead(Register8::Generic(n2)), RegRead(Register8::Generic(n3))];
+				match n4 {
+					0x0 => { v.swap_remove(0); }
+					0x1 => v.push(BOr),
+					0x2 => v.push(BAnd),
+					0x3 => v.push(BXor),
+					0x4 => {
+						// Add with overflow
+						v.push(AddOv); // -> Res, Ov
+						v.push(RegWrite(Register8::Generic(0xF)));
+						assert!(n2 != 0xF); // XXX
+					},
+					0x5 => {
+						v.push(Neg);
+						v.push(AddOv);
+						v.push(RegWrite(Register8::Generic(0xF)));
+						assert!(n2 != 0xF); // XXX
+					}
+					0x6 => {
+						// XXX: AMBIGUITY: Is VY used?
+						assert!(n2 == n3);
+						v.pop().unwrap();
+						v.push(BShrOv);
+						v.push(RegWrite(Register8::Generic(0xF)));
+						assert!(n2 != 0xF); // XXX
+					}
+					0x7 => {
+						v.swap(0, 1);
+						v.push(Neg);
+						v.push(AddOv);
+						v.push(RegWrite(Register8::Generic(0xF)));
+						assert!(n2 != 0xF); // XXX
+					}
+					0xE => {
+						// XXX: AMBIGUITY: Is VY used?
+						assert!(n2 == n3);
+						v.pop().unwrap();
+						v.push(BShlOv);
+						v.push(RegWrite(Register8::Generic(0xF)));
+						assert!(n2 != 0xF); // XXX
+					}
+					_ => return None,
+				}
+				v.push(RegWrite(Register8::Generic(n2)));
+				v
 			},
 			0x9 if n4 == 0
 			    => vec![RegRead(Register8::Generic(n2)), RegRead(Register8::Generic(n3)), Equal, BoolNot, CondSkipPC],
@@ -182,27 +293,58 @@ pub mod core {
 			},
 			0xF => {
 				// Special
-				unimplemented!()
-/*
-			(0xF,   x,   0,   7) => Chip8Instruction::ReadDelayTimer(x),
-			(0xF,   x,   0, 0xA) => Chip8Instruction::ReadKey(x),
-			(0xF,   x,   1,   5) => Chip8Instruction::SetDelayTimer(x),
-			(0xF,   x,   1,   8) => Chip8Instruction::SetSoundTimer(x),
-			(0xF,   x,   1, 0xE) => Chip8Instruction::IndexI(x),
-			(0xF,   x,   2,   9) => Chip8Instruction::LoadHexCharAddress(x),
-			(0xF,   x,   3,   3) => Chip8Instruction::ToDecimal(x),
-			(0xF,   x,   5,   5) => Chip8Instruction::BatchWrite(x),
-			(0xF,   x,   6,   5) => Chip8Instruction::BatchRead(x),
-*/
+				let x = Register8::Generic(n2);
+				match inst as u8 {
+					0x07 => vec![RegRead(Register8::DelayTimer), RegWrite(x)],
+					0x0A => vec![WaitForKeypress, RegWrite(x)],
+					0x15 => vec![RegRead(x), RegWrite(Register8::DelayTimer)],
+					0x18 => vec![RegRead(x), RegWrite(Register8::SoundTimer)],
+					0x1E => vec![GetI, RegRead(x), AddOffset, SetI], // XXX: Unclear - what to do when this overflows?
+					0x29 => vec![RegRead(x), HexCharAddr, SetI],
+					0x33 => vec![
+						RegRead(x),
+						DivMod10, GetI, PushImm(2), AddOffset, Swap2, MemWrite,
+						DivMod10, GetI, PushImm(1), AddOffset, Swap2, MemWrite,
+						GetI, Swap2, MemWrite],
+					0x55 => {
+						let mut v = Vec::with_capacity(n2 as usize * 7);
+						for i in 0 ..= n2 {
+							v.push(GetI);
+							v.push(RegRead(Register8::Generic(i)));
+							v.push(MemWrite);
+							v.push(GetI);
+							v.push(PushImm(1));
+							v.push(AddOffset);
+							v.push(SetI);
+						}
+						v
+					},
+					0x65 => {
+						let mut v = Vec::with_capacity(n2 as usize * 7);
+						for i in 0 ..= n2 {
+							v.push(GetI);
+							v.push(MemRead);
+							v.push(RegWrite(Register8::Generic(i)));
+							v.push(GetI);
+							v.push(PushImm(1));
+							v.push(AddOffset);
+							v.push(SetI);
+						}
+						v
+					},
+					_ => return None,
+				}
 			},
 			_ => return None,
 		})
 	}
 
 	pub fn run_instruction<S: Chip8State>(s: &mut S) {
-		match parse_instruction((s.read_mem(s.get_pc()) as u16) << 8 | s.read_mem(s.get_pc() + 1) as u16) {
-			_ => unimplemented!()
+		let mut v = vec![];
+		for il in parse_instruction((s.read_mem(s.get_pc()) as u16) << 8 | s.read_mem(s.get_pc() + 1) as u16).expect("Executed illegal instruction") {
+			il.execute(s, &mut v);
 		}
+		assert!(v.is_empty());
 	}
 }
 
