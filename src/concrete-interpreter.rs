@@ -72,7 +72,7 @@ impl ConcreteMachine {
 			// This multiplication now gives the number of ticks, and the remaining time!
 			let now = Instant::now();
 			let elapsed = now.duration_since(self.last_tick) * 60;
-			
+
 			if elapsed.as_secs() > 0 {
 				self.sound = (self.sound as u64).saturating_sub(elapsed.as_secs()) as u8;
 				self.delay = (self.delay as u64).saturating_sub(elapsed.as_secs()) as u8;
@@ -82,7 +82,21 @@ impl ConcreteMachine {
 				self.window.update_with_buffer(&self.screen_buf)?;
 				self.screen_dirty = false;
 			}
-			
+
+			let cur_i = (self.mem[self.pc as usize] as u16) << 8
+			          | self.mem[self.pc as usize + 1] as u16;
+			if cur_i == 0x1000 | self.pc {
+				println!("HALT!");
+				self.window.set_title("Chip-8 Concrete Interpreter | HALTED");
+				println!(" Closing window in 15 seconds.");
+				for _ in 0..150 {
+					self.window.update();
+					if !self.window.is_open() { break; }
+					std::thread::sleep(Duration::from_millis(100));
+				}
+				break;
+			}
+
 			std::thread::sleep(Duration::from_millis(30)); // FIXME: hardcoded sleep...
 		} // FIXME: This loop just sucks in general
 		Ok(())
