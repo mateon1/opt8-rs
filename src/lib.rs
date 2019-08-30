@@ -17,21 +17,21 @@ pub mod core {
 		fn wait_for_keypress(&mut self) -> u8;
 	}
 
-	#[derive(Clone, Copy, PartialEq)]
+	#[derive(Clone, Copy, PartialEq, Debug)]
 	pub enum Register8 {
 		Generic(u8), // Must be < 16
 		DelayTimer,
 		SoundTimer,
 	}
 
-	#[derive(Clone, Copy, PartialEq)]
+	#[derive(Clone, Copy, PartialEq, Debug)]
 	enum IntermediateValue {
 		Bool(bool),
 		Addr(u16),
 		Byte(u8),
 	}
 
-	#[derive(PartialEq, Clone, Copy)]
+	#[derive(PartialEq, Clone, Copy, Debug)]
 	pub enum IntermediateInst {
 		Illegal,
 
@@ -111,10 +111,28 @@ pub mod core {
 
 				RegRead(Register8::Generic(x)) => stack.push(Byte(state.read_gp_register(x))),
 				RegWrite(Register8::Generic(x)) => {
-					let v = match stack.pop().unwrap() { Byte(x) => x, _ => unreachable!(), };
+					let v = match stack.pop().unwrap() {
+						Byte(x) => x,
+						Bool(x) => x as u8,
+						_ => unreachable!(),
+					};
 					state.write_gp_register(x, v);
-				}
-				// XXX
+				},
+		//MemRead, // pops addr, returns u8
+		//MemWrite, // pops addr, value
+		//GetI,
+		//SetI,
+		//SetPC,
+		//OffsetPC, // UNCLEAR
+				CondSkipPC => {
+					let b = match stack.pop().unwrap() { Bool(x) => x, _ => unreachable!(), };
+					if b {
+						state.set_pc(state.get_pc() + 4);
+					}
+					return b;
+				},
+		//Call,
+		//Ret,
 
 				PushImm(v) => stack.push(Byte(v)),
 				PushImm16(v) => stack.push(Addr(v)),
@@ -152,10 +170,49 @@ pub mod core {
 					stack.push(if s { a } else { b });
 				}
 
-				Add => unimplemented!(),
+				Add => {
+					let a = stack.pop().unwrap();
+					let b = stack.pop().unwrap();
+					match (a, b) {
+						(Byte(a), Byte(b)) => { stack.push(Byte(a + b)); }
+						_ => unimplemented!(),
+					}
+				}
+				AddOv => {
+					let a = stack.pop().unwrap();
+					let b = stack.pop().unwrap();
+					match (a, b) {
+						(Byte(a), Byte(b)) => {
+							let (sum, ov) = a.overflowing_add(b);
+							stack.push(Byte(sum));
+							stack.push(Bool(ov));
+						}
+						_ => unimplemented!(),
+					}
+				}
+				BOr => {
+					let a = match stack.pop().unwrap() { Byte(x) => x, _ => unreachable!(), };
+					let b = match stack.pop().unwrap() { Byte(x) => x, _ => unreachable!(), };
+					stack.push(Byte(a | b));
+				},
+				BAnd => {
+					let a = match stack.pop().unwrap() { Byte(x) => x, _ => unreachable!(), };
+					let b = match stack.pop().unwrap() { Byte(x) => x, _ => unreachable!(), };
+					stack.push(Byte(a & b));
+				},
+				BXor => {
+					let a = match stack.pop().unwrap() { Byte(x) => x, _ => unreachable!(), };
+					let b = match stack.pop().unwrap() { Byte(x) => x, _ => unreachable!(), };
+					stack.push(Byte(a ^ b));
+				},
+		//DivMod10,
 				// XXX
-				Neg => unimplemented!(),
-				// XXX
+				Neg => {
+					let v = match stack.pop().unwrap() { Byte(x) => x, _ => unreachable!(), };
+					stack.push(Byte(v.wrapping_neg()))
+				},
+		//BShlOv,
+		//BShrOv,
 
 				AddOffset => unimplemented!(),
 
@@ -199,6 +256,7 @@ pub mod core {
 			0x5 if n4 == 0
 			    => vec![RegRead(Register8::Generic(n2)), RegRead(Register8::Generic(n3)), Equal,          CondSkipPC],
 			0x6 => vec![                                 PushImm(inst as u8),      RegWrite(Register8::Generic(n2))],
+			// XXX: Does this set VF?
 			0x7 => vec![RegRead(Register8::Generic(n2)), PushImm(inst as u8), Add, RegWrite(Register8::Generic(n2))],
 			0x8 => {
 				// Ops
@@ -258,11 +316,10 @@ pub mod core {
 				// XXX: What if X or Y are VF?
 				// TODO: Compare behavior to other emulators and remove these asserts later
 				assert!(n2 != 0xF && n3 != 0xF);
-				assert!(n4 != 0);
 				// NOTE: THIS IMPLEMENTATION IS INCORRECT
 				// The vertical wrapping behavior is wrong!
 				let mut v = vec![PushImm(1), PushImm(0), False];
-				for i in 0..n4 {
+				for i in 0..if n4 == 0 { 16 } else { n4 } {
 					v.push(RegRead(Register8::Generic(n2)));
 					v.push(RegRead(Register8::Generic(n3)));
 					if i != 0 {
@@ -341,8 +398,14 @@ pub mod core {
 
 	pub fn run_instruction<S: Chip8State>(s: &mut S) {
 		let mut v = vec![];
+		println!("PC = {:03x}", s.get_pc());
+		let mut pc_flag = false;
 		for il in parse_instruction((s.read_mem(s.get_pc()) as u16) << 8 | s.read_mem(s.get_pc() + 1) as u16).expect("Executed illegal instruction") {
-			il.execute(s, &mut v);
+			println!("IL: {:?} | Stack: {:?}", il, v);
+			pc_flag |= il.execute(s, &mut v);
+		}
+		if !pc_flag {
+			s.set_pc((s.get_pc() + 2) & 0xFFF); // XXX: Unclear on overflow
 		}
 		assert!(v.is_empty());
 	}
