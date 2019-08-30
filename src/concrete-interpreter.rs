@@ -5,6 +5,25 @@ use minifb::{Window, WindowOptions, Scale};
 
 use opt8::core;
 
+static SYSTEM_FONT: &'static [u8] = &[
+	0xF0, 0x90, 0x90, 0x90, 0xF0, // 0x0
+	0x20, 0x60, 0x20, 0x20, 0x70, // 0x1
+	0xF0, 0x10, 0xF0, 0x80, 0xF0, // 0x2
+	0xF0, 0x10, 0xF0, 0x10, 0xF0, // 0x3
+	0x90, 0x90, 0xF0, 0x10, 0x10, // 0x4
+	0xF0, 0x80, 0xF0, 0x10, 0xF0, // 0x5
+	0xF0, 0x80, 0xF0, 0x90, 0xF0, // 0x6
+	0xF0, 0x10, 0x20, 0x40, 0x40, // 0x7
+	0xF0, 0x90, 0xF0, 0x90, 0xF0, // 0x8
+	0xF0, 0x90, 0xF0, 0x10, 0xF0, // 0x9
+	0xF0, 0x90, 0xF0, 0x90, 0x90, // 0xA
+	0xE0, 0x90, 0xE0, 0x90, 0xE0, // 0xB
+	0xF0, 0x80, 0x80, 0x80, 0xF0, // 0xC
+	0xE0, 0x90, 0x90, 0x90, 0xE0, // 0xD
+	0xF0, 0x80, 0xF0, 0x80, 0xF0, // 0xE
+	0xF0, 0x80, 0xF0, 0x80, 0x80, // 0xF
+];
+
 struct ConcreteMachine {
 	mem: [u8; 0x1000],
 	reg: [u8; 16],
@@ -30,15 +49,16 @@ impl ConcreteMachine {
 			i: 0,
 			pc: 0x200,
 			stack: vec![],
-			screen_buf: [0; 64 * 32],
+			screen_buf: [0xFF000000; 64 * 32],
 			screen_clean: true,
 			screen_dirty: false,
 			window: Window::new("Chip-8 Concrete Interpreter", 64, 32,
 				WindowOptions { scale: Scale::X8, ..Default::default() }).unwrap(),
 			last_tick: Instant::now(),
 		};
+		(&mut this.mem[0..SYSTEM_FONT.len()]).copy_from_slice(SYSTEM_FONT);
 		(&mut this.mem[0x200..(rom.len() + 0x200)]).copy_from_slice(rom);
-		this.window.update_with_buffer(&this.screen_buf);
+		this.window.update_with_buffer(&this.screen_buf).unwrap();
 		this.window.update();
 		this
 	}
@@ -51,7 +71,7 @@ impl ConcreteMachine {
 			}
 			// This multiplication now gives the number of ticks, and the remaining time!
 			let now = Instant::now();
-			let mut elapsed = now.duration_since(self.last_tick) * 60;
+			let elapsed = now.duration_since(self.last_tick) * 60;
 			
 			if elapsed.as_secs() > 0 {
 				self.sound = (self.sound as u64).saturating_sub(elapsed.as_secs()) as u8;
@@ -59,11 +79,11 @@ impl ConcreteMachine {
 			}
 			self.last_tick = now - Duration::from_nanos(elapsed.subsec_nanos() as u64 / 60);
 			if self.screen_dirty {
-				self.window.update_with_buffer(&self.screen_buf);
+				self.window.update_with_buffer(&self.screen_buf)?;
 				self.screen_dirty = false;
 			}
 			
-			std::thread::sleep(Duration::from_millis(10)); // FIXME: hardcoded sleep...
+			std::thread::sleep(Duration::from_millis(30)); // FIXME: hardcoded sleep...
 		} // FIXME: This loop just sucks in general
 		Ok(())
 	}
@@ -103,7 +123,7 @@ impl core::Chip8State for ConcreteMachine {
 	fn clear_screen(&mut self) {
 		if self.screen_clean { return; }
 		for px in self.screen_buf.iter_mut() {
-			*px = 0;
+			*px = 0xFF000000;
 		}
 		self.screen_clean = true;
 		self.screen_dirty = true;
@@ -112,16 +132,25 @@ impl core::Chip8State for ConcreteMachine {
 		if bits == 0 { return false; }
 		self.screen_clean = false;
 		self.screen_dirty = true;
-		let idx = ((y & 0x1f) as usize) << 7 | ((x & 0x3f) as usize);
-		let mut smol = self.screen_buf[idx] as u8;
-		smol ^= bits;
-		let big = smol as u32;
-		self.screen_buf[idx] = 0xff000000 | (big << 8) | (big << 4) | big;
-		smol & bits != bits
+		let x = (x & 0x3F) as usize;
+		let y = (y & 0x1F) as usize;
+		let mut unset = false;
+		for xo in 0..8 {
+			if x + xo > 0x3F { break; }
+			let idx = y << 6 | (x + xo);
+			if bits & 1u8 << (7 - xo) != 0 {
+				self.screen_buf[idx] ^= 0xFFFFFF;
+				unset |= self.screen_buf[idx] != 0xFFFFFFFF;
+			}
+		}
+		unset
 	}
-	fn get_key_status(&self, k: u8) -> bool { false }
+	fn get_key_status(&self, _k: u8) -> bool { false }
 	fn wait_for_keypress(&mut self) -> u8 {
 		loop {}
+	}
+	fn get_hex_char_addr(&self, ch: u8) -> u16 {
+		ch as u16 * 5
 	}
 }
 
@@ -131,6 +160,12 @@ fn main() {
 	let path = args.next().expect("Need positional argument");
 	let mut data = vec![];
 	std::fs::File::open(path).unwrap().read_to_end(&mut data).unwrap();
+	for inst in data.chunks_exact_mut(2) {
+		// REPLACE SLOPPY SHIFTS
+		if inst[0] & 0xF0 == 0x80 && (inst[1] & 0x0F == 0x06 || inst[1] & 0x0F == 0x0E) {
+			inst[1] = (inst[0] & 0x0F) << 4 | inst[1] & 0x0F
+		}
+	}
 	assert!(data.len() < 0xDFF);
 	ConcreteMachine::new(&data).run().unwrap();
 }

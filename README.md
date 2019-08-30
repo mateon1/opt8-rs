@@ -5,7 +5,7 @@ This project is intended as an excercise and experiment in optimizing compilers 
 ## ROADMAP
 
 - [ ] Create proper documentation
-- [ ] Naïve interpreter
+- [x] Naïve interpreter
 - [ ] Symbolic interpreter
 - [ ] Extract basic blocks
 - [ ] Extract CFGs

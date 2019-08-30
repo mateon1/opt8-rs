@@ -15,6 +15,7 @@ pub mod core {
 		fn screen_xor_line(&mut self, x: u8, y: u8, bits: u8) -> bool;
 		fn get_key_status(&self, k: u8) -> bool;
 		fn wait_for_keypress(&mut self) -> u8;
+		fn get_hex_char_addr(&self, ch: u8) -> u16;
 	}
 
 	#[derive(Clone, Copy, PartialEq, Debug)]
@@ -100,14 +101,18 @@ pub mod core {
 					let n = match stack.pop().unwrap() { Byte(x) => x, _ => unreachable!(), };
 					let y = match stack.pop().unwrap() { Byte(x) => x, _ => unreachable!(), };
 					let x = match stack.pop().unwrap() { Byte(x) => x, _ => unreachable!(), };
-					stack.push(Bool(state.screen_xor_line(x, y, n)));
+					stack.push(Bool(state.screen_xor_line(x & 0x3F, y & 0x1F, n)));
 				},
 				WaitForKeypress => stack.push(Byte(state.wait_for_keypress())),
 				KeyPressed => {
 					let k = match stack.pop().unwrap() { Byte(x) => x, _ => unreachable!(), };
 					stack.push(Bool(state.get_key_status(k)));
 				},
-				HexCharAddr => unimplemented!(),
+				HexCharAddr => {
+					let c = match stack.pop().unwrap() { Byte(x) => x, _ => unreachable!(), };
+					assert!(c < 0x10); // XXX: What to do here?
+					stack.push(Addr(state.get_hex_char_addr(c)));
+				},
 
 				RegRead(Register8::Generic(x)) => stack.push(Byte(state.read_gp_register(x))),
 				RegWrite(Register8::Generic(x)) => {
@@ -118,11 +123,27 @@ pub mod core {
 					};
 					state.write_gp_register(x, v);
 				},
-		//MemRead, // pops addr, returns u8
-		//MemWrite, // pops addr, value
-		//GetI,
-		//SetI,
-		//SetPC,
+				MemRead => {
+					let a = match stack.pop().unwrap() { Addr(x) => x, _ => unreachable!(), };
+					stack.push(Byte(state.read_mem(a & 0xFFF)));
+				},
+				MemWrite => {
+					let v = match stack.pop().unwrap() { Byte(x) => x, _ => unreachable!(), };
+					let a = match stack.pop().unwrap() { Addr(x) => x, _ => unreachable!(), };
+					state.write_mem(a & 0xFFF, v);
+				},
+				GetI => {
+					stack.push(Addr(state.get_i()));
+				},
+				SetI => {
+					let a = match stack.pop().unwrap() { Addr(x) => x, _ => unreachable!(), };
+					state.set_i(a & 0xFFF);
+				},
+				SetPC => {
+					let a = match stack.pop().unwrap() { Addr(x) => x, _ => unreachable!(), };
+					state.set_pc(a & 0xFFF);
+					return true;
+				},
 		//OffsetPC, // UNCLEAR
 				CondSkipPC => {
 					let b = match stack.pop().unwrap() { Bool(x) => x, _ => unreachable!(), };
@@ -160,9 +181,9 @@ pub mod core {
 					stack.push(Bool(a | b));
 				},
 				Select => {
-					let a = stack.pop().unwrap();
-					let b = stack.pop().unwrap();
 					let s = match stack.pop().unwrap() { Bool(x) => x, _ => unreachable!(), };
+					let b = stack.pop().unwrap();
+					let a = stack.pop().unwrap();
 					match (a, b) {
 						(Byte(_), Byte(_)) => {}
 						_ => unimplemented!(),
@@ -205,16 +226,36 @@ pub mod core {
 					let b = match stack.pop().unwrap() { Byte(x) => x, _ => unreachable!(), };
 					stack.push(Byte(a ^ b));
 				},
-		//DivMod10,
-				// XXX
+				DivMod10 => {
+					let v = match stack.pop().unwrap() { Byte(x) => x, _ => unreachable!(), };
+					stack.push(Byte(v / 10));
+					stack.push(Byte(v % 10));
+				},
 				Neg => {
 					let v = match stack.pop().unwrap() { Byte(x) => x, _ => unreachable!(), };
 					stack.push(Byte(v.wrapping_neg()))
 				},
-		//BShlOv,
-		//BShrOv,
+				BShlOv => {
+					let v = match stack.pop().unwrap() { Byte(x) => x, _ => unreachable!(), };
+					let o = v & 0x80 != 0;
+					let v = v << 1;
+					stack.push(Byte(v));
+					stack.push(Bool(o));
+				},
+				BShrOv => {
+					let v = match stack.pop().unwrap() { Byte(x) => x, _ => unreachable!(), };
+					let o = v & 1 != 0;
+					let v = v >> 1;
+					stack.push(Byte(v));
+					stack.push(Bool(o));
+				},
 
-				AddOffset => unimplemented!(),
+				// XXX UNCLEAR: Overflow?
+				AddOffset => {
+					let v = match stack.pop().unwrap() { Byte(x) => x, _ => unreachable!(), };
+					let a = match stack.pop().unwrap() { Addr(x) => x, _ => unreachable!(), };
+					stack.push(Addr((a + v as u16) & 0xFFF));
+				},
 
 				_ => unimplemented!(),
 			}
@@ -280,8 +321,7 @@ pub mod core {
 					}
 					0x6 => {
 						// XXX: AMBIGUITY: Is VY used?
-						assert!(n2 == n3);
-						v.pop().unwrap();
+						v.swap_remove(0);
 						v.push(BShrOv);
 						v.push(RegWrite(Register8::Generic(0xF)));
 						assert!(n2 != 0xF); // XXX
@@ -295,8 +335,7 @@ pub mod core {
 					}
 					0xE => {
 						// XXX: AMBIGUITY: Is VY used?
-						assert!(n2 == n3);
-						v.pop().unwrap();
+						v.swap_remove(0);
 						v.push(BShlOv);
 						v.push(RegWrite(Register8::Generic(0xF)));
 						assert!(n2 != 0xF); // XXX
@@ -364,7 +403,7 @@ pub mod core {
 						DivMod10, GetI, PushImm(1), AddOffset, Swap2, MemWrite,
 						GetI, Swap2, MemWrite],
 					0x55 => {
-						let mut v = Vec::with_capacity(n2 as usize * 7);
+						let mut v = Vec::with_capacity(n2 as usize * 7 + 7);
 						for i in 0 ..= n2 {
 							v.push(GetI);
 							v.push(RegRead(Register8::Generic(i)));
